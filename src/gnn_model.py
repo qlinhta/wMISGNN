@@ -7,37 +7,64 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 
-class GNNModel(torch.nn.Module):
-    def __init__(self, num_features, hidden_dim1, hidden_dim2, num_classes, dropout_rate=0.5):
-        super(GNNModel, self).__init__()
-
+class ContrastiveGNN(torch.nn.Module):
+    def __init__(self, num_features, hidden_dim1, hidden_dim2, embedding_dim, dropout_rate=0.5):
+        super(ContrastiveGNN, self).__init__()
         # First GCN layer
         self.conv1 = GCNConv(num_features, hidden_dim1)
-
         # Second GCN layer
         self.conv2 = GCNConv(hidden_dim1, hidden_dim2)
-
-        # Third GCN layer (you can continue adding more layers if needed)
-        self.conv3 = GCNConv(hidden_dim2, num_classes)
-
+        # Third GCN layer to produce embeddings
+        self.conv3 = GCNConv(hidden_dim2, embedding_dim)
         # Dropout rate
         self.dropout_rate = dropout_rate
 
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
-
         # First layer
         x1 = F.relu(self.conv1(x, edge_index))
         x1 = F.dropout(x1, p=self.dropout_rate, training=self.training)
-
         # Second layer
         x2 = F.relu(self.conv2(x1, edge_index))
         x2 = F.dropout(x2, p=self.dropout_rate, training=self.training)
-
-        # Third layer
+        # Third layer to produce embeddings
         x3 = self.conv3(x2, edge_index)
+        return x3  # Return embeddings
 
-        return F.log_softmax(x3, dim=1)
+
+def contrastive_loss(embeddings, edge_index, margin=0.5, num_neg_samples=None):
+    # Extract embeddings for source and target nodes of edges
+    src_embeddings = embeddings[edge_index[0]]
+    tgt_embeddings = embeddings[edge_index[1]]
+    # Compute the dot product similarity for positive pairs (adjacent nodes)
+    pos_similarity = (src_embeddings * tgt_embeddings).sum(dim=1)
+    positive_loss = -torch.log(torch.sigmoid(pos_similarity))
+
+    # If num_neg_samples is None, use the same number as positive samples
+    num_neg_samples = num_neg_samples or len(edge_index[0])
+
+    # Randomly sample negative pairs
+    all_nodes = set(range(embeddings.shape[0]))
+    existing_edges = set(tuple(x) for x in edge_index.t().tolist())
+    negative_edges = set()
+
+    while len(negative_edges) < num_neg_samples:
+        i, j = torch.randint(0, embeddings.shape[0], (2,))
+        if (i.item(), j.item()) not in existing_edges and (i.item(), j.item()) not in negative_edges:
+            negative_edges.add((i.item(), j.item()))
+
+    neg_src, neg_tgt = zip(*negative_edges)
+    neg_src_embeddings = embeddings[list(neg_src)]
+    neg_tgt_embeddings = embeddings[list(neg_tgt)]
+
+    # Compute the dot product similarity for negative pairs (non-adjacent nodes)
+    neg_similarity = (neg_src_embeddings * neg_tgt_embeddings).sum(dim=1)
+    negative_loss = torch.log(torch.sigmoid(neg_similarity))
+
+    # Combine the positive and negative loss terms
+    loss = positive_loss.mean() + torch.clamp(margin - negative_loss, min=0).mean()
+
+    return loss
 
 
 def prepare_gnn_data(adjacency_matrix):
@@ -53,42 +80,3 @@ def prepare_gnn_data(adjacency_matrix):
     x = torch.eye(adjacency_matrix.shape[0])  # Node features as identity matrix
     data = Data(x=x, edge_index=edge_index)
     return data
-
-
-def train_gnn(data, expected_returns, epochs=100, learning_rate=0.05):
-    num_features = data.x.size(1)
-    model = GNNModel(num_features, hidden_dim1=128, hidden_dim2=128, num_classes=1)
-    target = torch.tensor(expected_returns, dtype=torch.float32).view(-1, 1)
-    loss_function = torch.nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
-    training_losses = []
-
-    model.train()
-    for epoch in range(epochs):
-        optimizer.zero_grad()
-        out = model(data)
-        loss = loss_function(out, target)
-        loss.backward()
-        optimizer.step()
-
-        # Append the loss for this epoch
-        training_losses.append(loss.item())
-
-        # Print the training loss
-        print(f"Epoch {epoch + 1}/{epochs}, Training Loss: {loss.item():.4f}")
-
-    # Get the embeddings from the last layer after training
-    with torch.no_grad():
-        embeddings = model(data).numpy()
-
-    # Plot the training loss
-    plt.figure(figsize=(10, 5))
-    plt.plot(training_losses, label='Training Loss')
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
-    plt.title('Training Loss over Epochs')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-
-    return embeddings
